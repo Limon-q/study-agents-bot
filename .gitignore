@@ -1,0 +1,33 @@
+# Секреты — никогда не коммитить
+.env
+
+# Профили пользователей — личные данные
+profiles/*
+!profiles/.gitkeep
+
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+.env/
+
+# Дистрибутив
+*.egg-info/
+dist/
+build/
+
+# Редакторы
+.idea/
+.vscode/
+*.swp
+*.swo
