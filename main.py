@@ -11,7 +11,6 @@ Telegram-бот с командой из 3 AI-агентов на базе Groq 
 и все агенты используют его для персонализированных ответов.
 """
 
-import asyncio
 import os
 import logging
 import time
@@ -19,15 +18,6 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
 
 # ---------------------------------------------------------------------------
 # Конфигурация
@@ -38,13 +28,10 @@ load_dotenv()
 TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 
-# Модель Groq, которую используют все агенты
 GROQ_MODEL = "llama-3.3-70b-versatile"
-
-# Максимальное количество сообщений в истории диалога (1 пара = 2 сообщения)
 MAX_HISTORY_MESSAGES = 20
+RESTART_DELAY = 5
 
-# Папка для хранения профилей пользователей (по одному файлу на user_id)
 PROFILES_DIR = Path("profiles")
 PROFILES_DIR.mkdir(exist_ok=True)
 
@@ -61,10 +48,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Определения агентов
 # ---------------------------------------------------------------------------
-# Каждый агент имеет:
-#   name          — отображаемое имя с эмодзи
-#   description   — краткое описание для меню
-#   system_prompt — системный промпт; {profile_section} заменяется профилем юзера
 
 AGENTS: dict[str, dict] = {
     "assistant": {
@@ -111,17 +94,11 @@ AGENTS: dict[str, dict] = {
 # ---------------------------------------------------------------------------
 # In-memory хранилище сессий
 # ---------------------------------------------------------------------------
-# sessions[user_id] = {
-#   "agent": str,               — ключ текущего агента
-#   "history": list[dict],      — история диалога (роль + контент)
-#   "awaiting_profile": bool,   — ожидаем ли следующее сообщение как профиль
-# }
 
 sessions: dict[int, dict] = {}
 
 
 def get_session(user_id: int) -> dict:
-    """Вернуть сессию пользователя, создав новую если её нет."""
     if user_id not in sessions:
         sessions[user_id] = {
             "agent": "assistant",
@@ -132,12 +109,11 @@ def get_session(user_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Работа с профилями пользователей
+# Профили пользователей
 # ---------------------------------------------------------------------------
 
 
 def get_profile(user_id: int) -> str | None:
-    """Прочитать профиль из файла. Вернуть None если файла нет."""
     profile_path = PROFILES_DIR / f"{user_id}.txt"
     if profile_path.exists():
         return profile_path.read_text(encoding="utf-8").strip()
@@ -145,7 +121,6 @@ def get_profile(user_id: int) -> str | None:
 
 
 def save_profile(user_id: int, profile_text: str) -> None:
-    """Сохранить профиль пользователя в файл profiles/<user_id>.txt."""
     profile_path = PROFILES_DIR / f"{user_id}.txt"
     profile_path.write_text(profile_text.strip(), encoding="utf-8")
     logger.info("Профиль сохранён: %s", profile_path)
@@ -157,14 +132,7 @@ def save_profile(user_id: int, profile_text: str) -> None:
 
 
 def build_system_prompt(agent_key: str, user_id: int) -> str:
-    """
-    Собрать финальный системный промпт агента.
-
-    Подставляет профиль пользователя в {profile_section}.
-    Если профиля нет — вставляет подсказку использовать /profile.
-    """
     profile = get_profile(user_id)
-
     if profile:
         profile_section = (
             "\n\n--- ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ ---\n"
@@ -179,48 +147,88 @@ def build_system_prompt(agent_key: str, user_id: int) -> str:
             "При первой возможности мягко предложи использовать команду /profile — "
             "это сделает ответы значительно более персонализированными."
         )
-
     return AGENTS[agent_key]["system_prompt"].format(profile_section=profile_section)
 
 
-def build_agent_keyboard() -> InlineKeyboardMarkup:
-    """Создать inline-клавиатуру для переключения между агентами."""
+def build_agent_keyboard() -> dict:
     buttons = [
-        [
-            InlineKeyboardButton(
-                f"{data['name']} — {data['description']}",
-                callback_data=f"switch_agent:{key}",
-            )
-        ]
+        [{"text": f"{data['name']} — {data['description']}",
+          "callback_data": f"switch_agent:{key}"}]
         for key, data in AGENTS.items()
     ]
-    return InlineKeyboardMarkup(buttons)
+    return {"inline_keyboard": buttons}
 
 
 # ---------------------------------------------------------------------------
-# Запрос к Groq API
+# Telegram API
+# ---------------------------------------------------------------------------
+
+_TG_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+
+def _tg(method: str, payload: dict | None = None) -> dict:
+    resp = requests.post(f"{_TG_BASE}/{method}", json=payload or {}, timeout=35)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def tg_send(chat_id: int, text: str, parse_mode: str | None = None,
+            reply_markup: dict | None = None) -> None:
+    payload: dict = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    _tg("sendMessage", payload)
+
+
+def tg_edit(chat_id: int, message_id: int, text: str,
+            parse_mode: str | None = None) -> None:
+    payload: dict = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    _tg("editMessageText", payload)
+
+
+def tg_answer_callback(callback_query_id: str) -> None:
+    _tg("answerCallbackQuery", {"callback_query_id": callback_query_id})
+
+
+def tg_typing(chat_id: int) -> None:
+    try:
+        _tg("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+    except Exception:
+        pass
+
+
+def tg_get_updates(offset: int | None, timeout: int = 30) -> list[dict]:
+    params: dict = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
+    if offset is not None:
+        params["offset"] = offset
+    resp = requests.post(f"{_TG_BASE}/getUpdates", json=params, timeout=timeout + 5)
+    resp.raise_for_status()
+    return resp.json().get("result", [])
+
+
+def send_long_message(chat_id: int, text: str) -> None:
+    limit = 4096
+    for i in range(0, len(text), limit):
+        tg_send(chat_id, text[i: i + limit])
+
+
+# ---------------------------------------------------------------------------
+# Groq API
 # ---------------------------------------------------------------------------
 
 
-async def ask_groq(
-    agent_key: str,
-    user_id: int,
-    history: list[dict],
-    user_message: str,
-) -> str:
-    """
-    Отправить запрос в Groq и вернуть текст ответа.
-
-    Передаёт системный промпт + историю диалога + новое сообщение.
-    """
+def ask_groq(agent_key: str, user_id: int, history: list[dict],
+             user_message: str) -> str:
     system_prompt = build_system_prompt(agent_key, user_id)
-
-    # Формируем список сообщений: system → история → новый запрос
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_message})
 
-    def _call() -> str:
+    try:
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
@@ -234,43 +242,21 @@ async def ask_groq(
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
-
-    try:
-        return await asyncio.to_thread(_call)
     except Exception as exc:
         logger.error("Ошибка Groq API: %s", exc)
         return f"⚠️ Произошла ошибка при обращении к AI: {exc}"
 
 
 # ---------------------------------------------------------------------------
-# Утилита: отправка длинных сообщений
+# Обработчики команд
 # ---------------------------------------------------------------------------
 
 
-async def send_long_message(update: Update, text: str) -> None:
-    """Разбить текст на части по 4096 символов и отправить последовательно."""
-    limit = 4096
-    for i in range(0, len(text), limit):
-        await update.message.reply_text(text[i : i + limit])
-
-
-# ===========================================================================
-# ОБРАБОТЧИКИ КОМАНД
-# ===========================================================================
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /start — приветствие и главное меню.
-
-    Показывает список агентов и подсказку про /profile.
-    """
-    user = update.effective_user
-    session = get_session(user.id)
+def handle_start(chat_id: int, user_id: int, first_name: str) -> None:
+    session = get_session(user_id)
     current = AGENTS[session["agent"]]["name"]
-
     text = (
-        f"👋 Привет, {user.first_name}!\n\n"
+        f"👋 Привет, {first_name}!\n\n"
         "Я — команда из трёх AI-агентов, каждый заточен под свою задачу:\n\n"
         "🗓 *Ассистент* — задачи, расписание, напоминания\n"
         "🔍 *Ресёрчер* — поиск и анализ информации\n"
@@ -280,47 +266,24 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Сейчас активен: *{current}*\n"
         "Выбери агента или сразу задай вопрос:"
     )
-
-    await update.message.reply_text(
-        text,
-        reply_markup=build_agent_keyboard(),
-        parse_mode="Markdown",
-    )
+    tg_send(chat_id, text, parse_mode="Markdown", reply_markup=build_agent_keyboard())
 
 
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /menu — показать меню выбора агента.
-
-    Полезно когда нужно быстро переключиться без /start.
-    """
-    user = update.effective_user
-    session = get_session(user.id)
+def handle_menu(chat_id: int, user_id: int) -> None:
+    session = get_session(user_id)
     current = AGENTS[session["agent"]]["name"]
-
-    await update.message.reply_text(
+    tg_send(
+        chat_id,
         f"🤖 Активный агент: *{current}*\n\nВыбери агента:",
-        reply_markup=build_agent_keyboard(),
         parse_mode="Markdown",
+        reply_markup=build_agent_keyboard(),
     )
 
 
-async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /profile — создать или обновить профиль пользователя.
-
-    Переводит сессию в режим ожидания: следующее сообщение
-    будет сохранено как профиль, а не передано агенту.
-    """
-    user = update.effective_user
-    session = get_session(user.id)
-    existing = get_profile(user.id)
-
-    # Показываем текущий профиль если он есть
-    current_block = ""
-    if existing:
-        current_block = f"📋 *Твой текущий профиль:*\n{existing}\n\n---\n\n"
-
+def handle_profile(chat_id: int, user_id: int) -> None:
+    session = get_session(user_id)
+    existing = get_profile(user_id)
+    current_block = f"📋 *Твой текущий профиль:*\n{existing}\n\n---\n\n" if existing else ""
     text = (
         f"{current_block}"
         "✏️ *Напиши свой профиль* следующим сообщением.\n\n"
@@ -336,119 +299,37 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Аудитория — технические основатели.»_\n\n"
         "📝 Отправь текст профиля:"
     )
-
-    # Устанавливаем флаг — следующее сообщение идёт в профиль
     session["awaiting_profile"] = True
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /clear — очистить историю диалога текущей сессии.
-
-    Профиль при этом сохраняется, удаляется только история переписки.
-    """
-    session = get_session(update.effective_user.id)
-    session["history"] = []
-
-    await update.message.reply_text(
-        "🗑 История диалога очищена. Начинаем с чистого листа!"
-    )
+    tg_send(chat_id, text, parse_mode="Markdown")
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /status — показать текущее состояние сессии.
+def handle_clear(chat_id: int, user_id: int) -> None:
+    get_session(user_id)["history"] = []
+    tg_send(chat_id, "🗑 История диалога очищена. Начинаем с чистого листа!")
 
-    Отображает: активный агент, длину истории, наличие профиля.
-    """
-    user = update.effective_user
-    session = get_session(user.id)
-    profile = get_profile(user.id)
 
+def handle_status(chat_id: int, user_id: int) -> None:
+    session = get_session(user_id)
+    profile = get_profile(user_id)
     profile_status = "✅ Заполнен" if profile else "❌ Не заполнен — используй /profile"
-    history_count = len(session["history"])
-    pairs = history_count // 2  # количество пар вопрос-ответ
-
+    pairs = len(session["history"]) // 2
     text = (
         "📊 *Статус сессии*\n\n"
         f"🤖 Агент: *{AGENTS[session['agent']]['name']}*\n"
         f"💬 История: *{pairs}* пар вопрос-ответ\n"
         f"👤 Профиль: *{profile_status}*"
     )
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-# ===========================================================================
-# ОБРАБОТЧИК INLINE-КНОПОК
-# ===========================================================================
+    tg_send(chat_id, text, parse_mode="Markdown")
 
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Обработчик нажатий на inline-кнопки меню агентов.
-
-    Переключает агента и сбрасывает историю диалога,
-    чтобы новый агент начинал без контекста предыдущего.
-    """
-    query = update.callback_query
-    await query.answer()  # убираем анимацию загрузки на кнопке
-
-    user_id = query.from_user.id
+def handle_text_message(chat_id: int, user_id: int, text: str) -> None:
     session = get_session(user_id)
 
-    if not query.data.startswith("switch_agent:"):
-        return
-
-    agent_key = query.data.split(":", 1)[1]
-
-    if agent_key not in AGENTS:
-        await query.edit_message_text("⚠️ Неизвестный агент.")
-        return
-
-    # Переключаем агента и сбрасываем историю (новый агент — новый контекст)
-    session["agent"] = agent_key
-    session["history"] = []
-
-    agent = AGENTS[agent_key]
-    profile = get_profile(user_id)
-    profile_hint = "" if profile else "\n\n💡 Заполни /profile для персонализации ответов."
-
-    await query.edit_message_text(
-        f"✅ Переключился на *{agent['name']}*\n"
-        f"_{agent['description']}_\n\n"
-        f"История сброшена. Задавай вопросы!{profile_hint}",
-        parse_mode="Markdown",
-    )
-
-
-# ===========================================================================
-# ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
-# ===========================================================================
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Главный обработчик входящих текстовых сообщений.
-
-    Два режима:
-    1. Режим профиля (awaiting_profile=True) — сохраняет текст как профиль.
-    2. Обычный режим — передаёт сообщение текущему агенту через Groq API.
-    """
-    user = update.effective_user
-    session = get_session(user.id)
-    text = update.message.text
-
-    # -------------------------------------------------------------------
-    # Режим сохранения профиля
-    # -------------------------------------------------------------------
     if session["awaiting_profile"]:
         session["awaiting_profile"] = False
-        save_profile(user.id, text)
-
-        await update.message.reply_text(
+        save_profile(user_id, text)
+        tg_send(
+            chat_id,
             "✅ *Профиль сохранён!*\n\n"
             "Все агенты теперь будут учитывать информацию о тебе.\n"
             f"Активный агент: *{AGENTS[session['agent']]['name']}*\n\n"
@@ -457,125 +338,132 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # -------------------------------------------------------------------
-    # Обычный диалог с агентом
-    # -------------------------------------------------------------------
-    logger.info("Сообщение от user_id=%s агент=%s: %s", user.id, session["agent"], text[:60])
-
-    # send_chat_action — только косметика, не критично если упадёт
-    try:
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action="typing",
-        )
-    except Exception:
-        pass
+    logger.info("Сообщение от user_id=%s агент=%s: %s", user_id, session["agent"], text[:60])
+    tg_typing(chat_id)
 
     agent_key = session["agent"]
-    response = await ask_groq(agent_key, user.id, session["history"], text)
+    response = ask_groq(agent_key, user_id, session["history"], text)
 
-    # Обновляем историю диалога (сначала запрос, потом ответ)
     session["history"].append({"role": "user", "content": text})
     session["history"].append({"role": "assistant", "content": response})
 
-    # Обрезаем историю до MAX_HISTORY_MESSAGES чтобы не раздувать контекст
     if len(session["history"]) > MAX_HISTORY_MESSAGES:
         session["history"] = session["history"][-MAX_HISTORY_MESSAGES:]
 
-    # Добавляем подпись агента к ответу
-    agent_name = AGENTS[agent_key]["name"]
-    full_response = f"{agent_name}:\n\n{response}"
-
-    await send_long_message(update, full_response)
+    send_long_message(chat_id, f"{AGENTS[agent_key]['name']}:\n\n{response}")
 
 
-# ===========================================================================
-# ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Обработчик callback-кнопок
+# ---------------------------------------------------------------------------
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Ловит все необработанные исключения из handlers и логирует их.
+def handle_callback(callback_query: dict) -> None:
+    query_id = callback_query["id"]
+    user_id = callback_query["from"]["id"]
+    chat_id = callback_query["message"]["chat"]["id"]
+    message_id = callback_query["message"]["message_id"]
+    data = callback_query.get("data", "")
 
-    Без этого исключения в handlers молча проглатываются фреймворком,
-    и пользователь не получает никакого ответа.
-    """
-    logger.error("Необработанное исключение:", exc_info=context.error)
+    try:
+        tg_answer_callback(query_id)
+    except Exception:
+        pass
 
-    # Сообщаем пользователю об ошибке если есть активное сообщение
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "⚠️ Что-то пошло не так. Попробуй ещё раз или используй /clear."
-            )
-        except Exception:
-            pass
+    if not data.startswith("switch_agent:"):
+        return
+
+    agent_key = data.split(":", 1)[1]
+    if agent_key not in AGENTS:
+        tg_edit(chat_id, message_id, "⚠️ Неизвестный агент.")
+        return
+
+    session = get_session(user_id)
+    session["agent"] = agent_key
+    session["history"] = []
+
+    agent = AGENTS[agent_key]
+    profile_hint = "" if get_profile(user_id) else "\n\n💡 Заполни /profile для персонализации ответов."
+
+    tg_edit(
+        chat_id,
+        message_id,
+        f"✅ Переключился на *{agent['name']}*\n"
+        f"_{agent['description']}_\n\n"
+        f"История сброшена. Задавай вопросы!{profile_hint}",
+        parse_mode="Markdown",
+    )
 
 
-# ===========================================================================
-# ТОЧКА ВХОДА
-# ===========================================================================
-
-RESTART_DELAY = 5  # секунд между перезапусками после краша
+# ---------------------------------------------------------------------------
+# Диспетчер входящих обновлений
+# ---------------------------------------------------------------------------
 
 
-def build_app() -> Application:
-    """Собрать и настроить Application. Вызывается заново при каждом перезапуске."""
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+def process_update(update: dict) -> None:
+    try:
+        if "callback_query" in update:
+            handle_callback(update["callback_query"])
+            return
 
-    # --- Команды ---
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("profile", cmd_profile))
-    app.add_handler(CommandHandler("clear", cmd_clear))
-    app.add_handler(CommandHandler("status", cmd_status))
+        message = update.get("message")
+        if not message:
+            return
 
-    # --- Кнопки ---
-    app.add_handler(CallbackQueryHandler(handle_callback))
+        text: str = message.get("text", "")
+        if not text:
+            return
 
-    # --- Обычные сообщения (не команды) ---
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        chat_id: int = message["chat"]["id"]
+        user_id: int = message["from"]["id"]
+        first_name: str = message["from"].get("first_name", "")
 
-    # --- Глобальный обработчик ошибок ---
-    app.add_error_handler(error_handler)
+        if text.startswith("/start"):
+            handle_start(chat_id, user_id, first_name)
+        elif text.startswith("/menu"):
+            handle_menu(chat_id, user_id)
+        elif text.startswith("/profile"):
+            handle_profile(chat_id, user_id)
+        elif text.startswith("/clear"):
+            handle_clear(chat_id, user_id)
+        elif text.startswith("/status"):
+            handle_status(chat_id, user_id)
+        elif not text.startswith("/"):
+            handle_text_message(chat_id, user_id, text)
 
-    return app
+    except Exception as exc:
+        logger.error("Ошибка обработки update %s: %s", update.get("update_id"), exc)
+
+
+# ---------------------------------------------------------------------------
+# Главный цикл long polling
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    """
-    Главная точка входа с авто-перезапуском.
-
-    Если polling падает с любым исключением (кроме Ctrl+C),
-    бот ждёт RESTART_DELAY секунд и запускается заново.
-    Application нельзя переиспользовать после остановки,
-    поэтому при каждом перезапуске создаётся новый экземпляр.
-    """
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_TOKEN не задан в .env файле")
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY не задан в .env файле")
 
+    offset: int | None = None
     attempt = 0
+
     while True:
         attempt += 1
-        logger.info("Запуск бота (попытка #%d)...", attempt)
+        logger.info("Запуск polling (попытка #%d)...", attempt)
         try:
-            app = build_app()
-            app.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                # drop_pending_updates=False — подбираем накопленные сообщения
-            )
-            # run_polling вернулся нормально — значит Ctrl+C или явная остановка
-            logger.info("Бот остановлен штатно.")
-            break
+            while True:
+                updates = tg_get_updates(offset=offset, timeout=30)
+                for update in updates:
+                    offset = update["update_id"] + 1
+                    process_update(update)
         except KeyboardInterrupt:
             logger.info("Бот остановлен пользователем (Ctrl+C).")
             break
         except Exception as exc:
             logger.error(
-                "Критическая ошибка (попытка #%d): %s. Перезапуск через %d сек...",
+                "Ошибка polling (попытка #%d): %s. Перезапуск через %d сек...",
                 attempt, exc, RESTART_DELAY,
             )
             time.sleep(RESTART_DELAY)
