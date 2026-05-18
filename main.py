@@ -11,13 +11,14 @@ Telegram-бот с командой из 3 AI-агентов на базе Groq 
 и все агенты используют его для персонализированных ответов.
 """
 
+import asyncio
 import os
 import logging
 import time
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
-from groq import AsyncGroq
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -56,13 +57,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Инициализация асинхронного клиента Groq
-# ---------------------------------------------------------------------------
-
-# timeout=30 — предотвращает зависание если прокси или сеть не отвечают
-groq_client = AsyncGroq(api_key=GROQ_API_KEY, timeout=30.0)
 
 # ---------------------------------------------------------------------------
 # Определения агентов
@@ -226,14 +220,23 @@ async def ask_groq(
     messages.extend(history)
     messages.append({"role": "user", "content": user_message})
 
-    try:
-        response = await groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            max_tokens=2048,
-            temperature=0.7,
+    def _call() -> str:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": messages,
+                "max_tokens": 2048,
+                "temperature": 0.7,
+            },
+            timeout=30,
         )
-        return response.choices[0].message.content
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        return await asyncio.to_thread(_call)
     except Exception as exc:
         logger.error("Ошибка Groq API: %s", exc)
         return f"⚠️ Произошла ошибка при обращении к AI: {exc}"
